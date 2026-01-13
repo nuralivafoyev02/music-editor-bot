@@ -8,9 +8,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from mutagen.id3 import ID3, TIT2, APIC, error
-from mutagen.mp3 import MP3
-from mutagen.easyid3 import EasyID3
 from supabase import create_client, Client
+from aiogram.exceptions import TelegramBadRequest
+
+# --- LOGGING SOZLAMALARI ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 # --- SOZLAMALAR ---
 BOT_TOKEN = "8390443392:AAGrr9hwOz0gw_m4CbrlCGwKA2gmlFcOBrs"
@@ -21,9 +28,7 @@ ADMIN_ID = 7894854944
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-logging.basicConfig(level=logging.INFO)
 
-# --- FSM HOLATLARI ---
 class EditorStates(StatesGroup):
     waiting_for_mp3 = State()
     choosing_action = State()
@@ -33,7 +38,7 @@ class EditorStates(StatesGroup):
 class AdminStates(StatesGroup):
     waiting_for_ad_content = State()
 
-# --- DINAMIK TUGMALAR ---
+# --- KEYBOARDS ---
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Nomni tahrirlash", callback_data="edit_name"),
@@ -47,21 +52,23 @@ def back_kb():
         [InlineKeyboardButton(text="⬅️ Orqaga qaytish", callback_data="back_to_menu")]
     ])
 
-# --- ADMIN FUNKSIYALARI ---
+# --- UTILS ---
+async def safe_delete_message(message: types.Message):
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass # Xabar allaqachon yo'q bo'lsa, e'tibor bermaymiz
+
+# --- ADMIN COMMANDS ---
 @dp.message(Command("stats"), F.from_user.id == ADMIN_ID)
 async def get_stats(message: types.Message):
     try:
         res = supabase.table("mp3_logs").select("*").execute()
         total_edits = len(res.data)
         unique_users = len(set([row['user_id'] for row in res.data]))
-        text = (
-            "📊 <b>Bot Statistikasi</b>\n\n"
-            f"👤 Foydalanuvchilar: <code>{unique_users} ta</code>\n"
-            f"🎵 Tahrirlangan: <code>{total_edits} ta</code>"
-        )
-        await message.answer(text, parse_mode="HTML")
+        await message.answer(f"📊 <b>Bot Statistikasi</b>\n\n👤 Foydalanuvchilar: <code>{unique_users} ta</code>\n🎵 Tahrirlangan: <code>{total_edits} ta</code>", parse_mode="HTML")
     except Exception as e:
-        await message.answer(f"❌ Xato: {e}")
+        logger.error(f"Stats error: {e}")
 
 @dp.message(Command("send"), F.from_user.id == ADMIN_ID)
 async def start_mailing(message: types.Message, state: FSMContext):
@@ -82,7 +89,7 @@ async def broadcast_message(message: types.Message, state: FSMContext):
     await message.answer(f"✅ <b>Yuborildi:</b> <code>{count}</code> ta foydalanuvchiga.", parse_mode="HTML")
     await state.clear()
 
-# --- ASOSIY BOT LOGIKASI ---
+# --- MAIN LOGIC ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
@@ -98,16 +105,16 @@ async def handle_audio(message: types.Message, state: FSMContext):
     os.makedirs("downloads", exist_ok=True)
     file_path = os.path.abspath(f"downloads/{file_id}.mp3")
     
-    file = await bot.get_file(file_id)
-    await bot.download_file(file.file_path, file_path)
-    
-    await status.edit_text(
-        f"🎧 <b>Musiqa tanlandi:</b>\n<code>{file_name}</code>",
-        reply_markup=main_menu_kb(),
-        parse_mode="HTML"
-    )
-    await state.update_data(current_file=file_path, original_name=file_name, main_msg_id=status.message_id)
-    await state.set_state(EditorStates.choosing_action)
+    try:
+        file = await bot.get_file(file_id)
+        await bot.download_file(file.file_path, file_path)
+        logger.info(f"Fayl yuklandi: {file_path}")
+        
+        await status.edit_text(f"🎧 <b>Musiqa tanlandi:</b>\n<code>{file_name}</code>", reply_markup=main_menu_kb(), parse_mode="HTML")
+        await state.update_data(current_file=file_path, original_name=file_name, main_msg_id=status.message_id)
+        await state.set_state(EditorStates.choosing_action)
+    except Exception as e:
+        logger.error(f"Yuklashda xato: {e}")
 
 @dp.message(EditorStates.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
@@ -116,14 +123,16 @@ async def process_name(message: types.Message, state: FSMContext):
     file_path = data.get('current_file')
     main_msg_id = data.get('main_msg_id')
 
+    await safe_delete_message(message)
+    
     try:
-        await message.delete()
-        # "Can't sync to MPEG frame" xatosini chetlab o'tish uchun to'g'ridan-to'g'ri ID3 ishlatamiz
+        logger.info(f"Nom o'zgarmoqda: {new_title}")
         try:
             tags = ID3(file_path)
         except error:
+            logger.info("Yangi ID3 teg yaratilmoqda...")
             tags = ID3()
-            
+
         tags.add(TIT2(encoding=3, text=new_title))
         tags.save(file_path, v2_version=3)
         
@@ -137,8 +146,7 @@ async def process_name(message: types.Message, state: FSMContext):
         )
         await state.set_state(EditorStates.choosing_action)
     except Exception as e:
-        logging.error(f"Xato: {e}")
-        await message.answer(f"⚠️ Xatolik: {e}")
+        logger.error(f"Nom tahrir xatosi: {e}", exc_info=True)
 
 @dp.message(F.photo, EditorStates.waiting_for_cover)
 async def process_cover(message: types.Message, state: FSMContext):
@@ -146,13 +154,19 @@ async def process_cover(message: types.Message, state: FSMContext):
     file_path = data.get('current_file')
     main_msg_id = data.get('main_msg_id')
 
-    await message.delete()
-    photo_file = await bot.get_file(message.photo[-1].file_id)
-    dest = io.BytesIO()
-    await bot.download_file(photo_file.file_path, dest)
+    await safe_delete_message(message)
     
     try:
-        tags = ID3(file_path)
+        photo_file = await bot.get_file(message.photo[-1].file_id)
+        dest = io.BytesIO()
+        await bot.download_file(photo_file.file_path, dest)
+        
+        logger.info(f"Muqova o'zgarmoqda: {file_path}")
+        try:
+            tags = ID3(file_path)
+        except error:
+            tags = ID3()
+            
         tags.delall('APIC')
         tags.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=dest.getvalue()))
         tags.save(file_path, v2_version=3)
@@ -166,7 +180,7 @@ async def process_cover(message: types.Message, state: FSMContext):
         )
         await state.set_state(EditorStates.choosing_action)
     except Exception as e:
-        await message.answer(f"⚠️ Rasmda xatolik: {e}")
+        logger.error(f"Cover error: {e}", exc_info=True)
 
 @dp.callback_query(F.data == "send_final")
 async def send_music(call: types.CallbackQuery, state: FSMContext):
@@ -176,14 +190,14 @@ async def send_music(call: types.CallbackQuery, state: FSMContext):
     
     await call.message.edit_text("🚀 <b>Tayyorlanmoqda...</b>", parse_mode="HTML")
     
-    clean_name = "".join([c for c in new_title if c.isalnum() or c in (' ', '-', '_')]).strip() + ".mp3"
-    final_path = os.path.join("downloads", clean_name)
-
     try:
-        os.rename(file_path, final_path)
+        # Fayl nomini xavfsiz qilish
+        safe_name = "".join([c for c in new_title if c.isalnum() or c in (' ', '-', '_')]).strip()
+        audio_file = FSInputFile(path=file_path, filename=f"{safe_name or 'music'}.mp3")
+
         await bot.send_audio(
             chat_id=call.message.chat.id,
-            audio=FSInputFile(final_path),
+            audio=audio_file,
             title=new_title,
             caption=f"🎵 <b>{new_title}</b>\n\n✅ @music_editormirshodbot",
             parse_mode="HTML"
@@ -191,12 +205,11 @@ async def send_music(call: types.CallbackQuery, state: FSMContext):
         await call.message.delete()
         supabase.table("mp3_logs").insert({"user_id": call.from_user.id, "action_type": "success"}).execute()
     except Exception as e:
-        await call.message.answer(f"🚀 Xato: {e}")
+        logger.error(f"Send error: {e}")
     finally:
-        if os.path.exists(final_path): os.remove(final_path)
+        if file_path and os.path.exists(file_path): os.remove(file_path)
         await state.clear()
 
-# --- QOLGAN CALLBACKLAR ---
 @dp.callback_query(F.data == "edit_name")
 async def edit_name_call(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("📝 <b>Yangi nomni yuboring:</b>", reply_markup=back_kb(), parse_mode="HTML")
@@ -215,8 +228,11 @@ async def back(call: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "cancel_edit")
 async def cancel(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if data.get('current_file') and os.path.exists(data.get('current_file')):
+        os.remove(data.get('current_file'))
     await state.clear()
-    await call.message.edit_text("🗑 Bekor qilindi. Yangi fayl yuborishingiz mumkin.")
+    await call.message.edit_text("🗑 Bekor qilindi.")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
